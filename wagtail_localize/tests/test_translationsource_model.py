@@ -2,7 +2,9 @@ import json
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
+from django.db import connection
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from wagtail.blocks import StreamValue
 from wagtail.models import Locale, Page, PageLogEntry
@@ -24,6 +26,7 @@ from wagtail_localize.test.models import (
     TestPage,
     TestRevisionsButNoDraftModel,
     TestSnippet,
+    TestStreamBlock,
     TestSynchronizedChildObject,
 )
 
@@ -992,3 +995,35 @@ class TestSchemaOutOfDate(TestCase):
         self.source.schema_version = "0001_initial_stub"
         self.source.save()
         self.assertTrue(self.source.schema_out_of_date())
+
+
+class TestRefreshSegmentsQueryCount(TestCase):
+    def _count_refresh_queries(self, num_blocks):
+        page = create_test_page(
+            title=f"Test page {num_blocks}",
+            slug=f"test-page-{num_blocks}",
+            test_charfield="Some translatable content",
+            test_textfield="Some more translatable content",
+            test_streamfield=StreamValue(
+                TestStreamBlock(),
+                [
+                    {"type": "test_charblock", "value": f"Block {i}"}
+                    for i in range(num_blocks)
+                ],
+                is_lazy=True,
+            ),
+        )
+        source = TranslationSource.objects.get(object_id=page.translation_key)
+
+        with CaptureQueriesContext(connection) as ctx:
+            source.refresh_segments()
+
+        return len(ctx.captured_queries)
+
+    def test_refresh_segments_query_count_scales_with_segments(self):
+        # Subtracting the two counts cancels the fixed overhead and isolates the
+        # marginal per-segment cost. Each extra segment currently adds ~4 queries.
+        small = self._count_refresh_queries(num_blocks=3)
+        large = self._count_refresh_queries(num_blocks=12)
+
+        self.assertGreaterEqual(large - small, 9 * 4)
