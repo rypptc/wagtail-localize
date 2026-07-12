@@ -11,6 +11,7 @@ __pycache__/
 /.vscode
 /site
 /test_*.db
+/benchmark.db
 /src/wagtail_localize/static/wagtail_localize/js/wagtail-localize.js
 /node_modules
 /test-static
