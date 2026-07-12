@@ -17,19 +17,18 @@ env.bootstrap()
 # Models can only be imported after env.bootstrap() has run.
 from wagtail.models import Locale, Page  # noqa: E402
 
-from tests.testapp.models import TestHomePage, TestPage  # noqa: E402
+from tests.testapp.models import TestHomePage, TestPage, TestSnippet  # noqa: E402
 
 
 # The locales we translate against, and a fixed slug for the benchmark home so
 # we can find and clear a previous run before reseeding.
 TARGET_LANGUAGES = ["en", "fr", "es"]
 HOME_SLUG = "bench-home"
-# 4, not 5: translate_some() picks French pages via i % 5 == 0. If
-# SECTION_COUNT shared that modulus, every French page would land in the
-# same section (verified empirically 2026-07-12 — it did, with
-# SECTION_COUNT=5). 4 is coprime with both 5 and 7 (the French/Spanish
-# selection moduli), so translated/aliased pages spread across all sections.
-SECTION_COUNT = 4
+# Pages are handed to categories in rotation (page 0 -> category 0, page 1 ->
+# category 1, ...). We translate every 5th page. With 5 categories, every 5th
+# page loops back to the same category, so all translations would stack in
+# category 0. 4 categories spreads them out instead.
+CATEGORY_COUNT = 4
 
 
 def ensure_locales():
@@ -40,50 +39,73 @@ def ensure_locales():
     }
 
 
-def reset_tree():
-    """Remove a previous benchmark tree so reseeding starts from a clean state."""
+def reset():
+    """Remove a previous benchmark run so reseeding starts clean.
+
+    Clears both the page tree and the related-object pool. benchmark.db is a
+    dedicated database (gitignored, never the test suite's), so deleting all
+    TestSnippets is safe — they only ever come from this seed.
+    """
     # startswith, not an exact match: copy_for_translation suffixes the slug
     # per locale (e.g. "bench-home-fr") to avoid sibling slug collisions.
     for page in Page.objects.filter(slug__startswith=HOME_SLUG):
         page.delete()
+    TestSnippet.objects.all().delete()
 
 
-def build_tree(pages, locale):
-    """Build a home page with `pages` child pages, spread across
-    SECTION_COUNT section pages rather than all as direct children of home.
+def build_snippet_pool(count, locale):
+    """Create a pool of translatable snippets. Pages reference these (see
+    build_tree), reusing snippets across pages the way a real site reuses
+    shared content — which also gives the benchmark real related objects to
+    exercise when translating.
+    """
+    return [
+        TestSnippet.objects.create(
+            field=f"Snippet {i} body — translatable text.",
+            small_charfield=f"tag-{i}"[:10],
+            locale=locale,
+        )
+        for i in range(count)
+    ]
 
-    This matters: a flat tree (all pages sharing one parent) makes every
-    page's get_parent() call resolve to the exact same row, which some
-    tools mistake for a fixable "duplicate query" — an artifact of the flat
-    shape, not a property of the tool (verified against django-query-doctor,
-    2026-07-12). Spreading pages across several sections gives each page a
-    genuinely different parent, matching the shape wl-benchmark's own
-    "realistic universe" seeder uses (multiple sections, each with its own
-    articles) — unlike wl-benchmark's synctree-specific scaling script,
-    which was flat in the same way this tree used to be.
 
-    Returns (home, pages) — home for tree-level operations, pages as the
-    flat list of leaf pages actually seeded (translate_some needs this list
-    directly, since home.get_children() now returns sections, not pages).
+def build_tree(pages, locale, snippets):
+    """Build a home page with `pages` child pages, organized under
+    CATEGORY_COUNT categories (as a real site groups content, rather than
+    hanging every page off one parent). Each page references a snippet from
+    `snippets`, reusing the pool across pages the way a real site reuses
+    shared content.
+
+    Returns (home, pages): home for tree-level operations, and the flat list
+    of leaf pages (home.get_children() returns the categories, not the pages).
     """
     root = Page.objects.get(depth=1)
     home = root.add_child(
         instance=TestHomePage(title="Bench Home", slug=HOME_SLUG, locale=locale)
     )
-    sections = [
+    categories = [
         home.add_child(
             instance=TestPage(
-                title=f"Section {s}", slug=f"bench-section-{s}", locale=locale
+                title=f"Category {c}", slug=f"bench-category-{c}", locale=locale
             )
         )
-        for s in range(SECTION_COUNT)
+        for c in range(CATEGORY_COUNT)
     ]
 
     pages_list = []
     for i in range(pages):
-        section = sections[i % SECTION_COUNT]
-        page = section.add_child(
-            instance=TestPage(title=f"Page {i}", slug=f"bench-page-{i}", locale=locale)
+        category = categories[i % CATEGORY_COUNT]
+        page = category.add_child(
+            instance=TestPage(
+                title=f"Page {i}",
+                slug=f"bench-page-{i}",
+                locale=locale,
+                test_snippet=snippets[i % len(snippets)],
+                test_richtextfield=(
+                    f"<p>Body text for page {i}. This paragraph is "
+                    f"translatable prose that produces a segment.</p>"
+                ),
+            )
         )
         pages_list.append(page)
 
@@ -112,13 +134,15 @@ def main():
     args = parser.parse_args()
 
     locales = ensure_locales()
-    reset_tree()
-    home, pages = build_tree(args.pages, locales["en"])
+    reset()
+    snippets = build_snippet_pool(max(args.pages // 3, 1), locales["en"])
+    home, pages = build_tree(args.pages, locales["en"], snippets)
     translate_some(pages, locales)
 
     print(
-        f"Seeded {len(pages)} pages across {SECTION_COUNT} sections under '{home.slug}'."
+        f"Seeded {len(pages)} pages across {CATEGORY_COUNT} categories under '{home.slug}'."
     )
+    print(f"Seeded {len(snippets)} snippets in the related-object pool.")
     # +2 vs. the seeded count: Wagtail's own migrations create the tree root
     # and a default "Welcome to your new Wagtail site!" page. We leave both
     # alone — the translation-sync operations under benchmark (synctree,
