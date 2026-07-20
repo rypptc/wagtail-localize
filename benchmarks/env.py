@@ -16,9 +16,15 @@ import sys
 
 
 def bootstrap():
-    # Make the repo root importable, so `tests.testapp...` resolves. This
-    # file is benchmarks/env.py, so one level up is the repo root.
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # This file is benchmarks/env.py, so one level up is the repo root. Make
+    # both the repo root (so `tests.testapp...` resolves) and repo_root/src
+    # (where the src/ layout puts `wagtail_localize`) importable — otherwise
+    # `.venv/bin/python benchmarks/seed.py` fails with ModuleNotFoundError:
+    # wagtail_localize when the package isn't installed editable.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for path in (repo_root, os.path.join(repo_root, "src")):
+        if path not in sys.path:
+            sys.path.insert(0, path)
 
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.testapp.settings")
     os.environ.setdefault("DATABASE_URL", "sqlite:///benchmark.db")
