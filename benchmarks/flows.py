@@ -16,6 +16,9 @@ from types import SimpleNamespace
 # this is an initial probe, not a scaling sweep.
 PAGES = 12
 SNIPPETS = 4
+# How many extra pages core_create_translations/core_synchronize_tree walk,
+# on top of existing_page/submit_page (kept disjoint so flows don't collide).
+CORE_PAGES = 5
 # How many page translations to pre-create, so the report view renders several
 # rows rather than a single one. Still small — a smoke test with a bit of body,
 # not a scale sweep.
@@ -26,10 +29,12 @@ REPORT_PAGE_TRANSLATIONS = 5
 class Flow:
     """One flow we evaluate, plus the metadata that makes its coverage legible.
 
-    `run` takes a prepared context (see prepare()) and drives the flow, returning
-    the Django test-client response. `setup`, if given, runs against the context
-    BEFORE measurement — for preconditions a tool shouldn't count. Everything
-    else is documentation that print_catalog() prints verbatim.
+    `run` takes a prepared context (see prepare()) and drives the flow. Admin
+    flows return the Django test-client response; core (operations-layer)
+    flows return None — there's no HTTP status to report for those. `setup`,
+    if given, runs against the context BEFORE measurement — for preconditions
+    a tool shouldn't count. Everything else is documentation that
+    print_catalog() prints verbatim.
     """
 
     name: str
@@ -98,8 +103,18 @@ def prepare():
     """Build fresh data for a single flow run.
 
     Called before every flow so results never depend on the order flows run in.
-    Seeds a small tree with shared snippets, an admin client, and several pages
-    and snippets already translated to French for the read/update flows.
+    Seeds a small tree with shared snippets, an admin client, and a handful of
+    pages/snippets already translated to French. Page and snippet slices are
+    kept disjoint across roles (existing/report/core/submit) so flows don't
+    collide with each other's preconditions:
+
+        pages:    [0]        existing_page
+                  [1:5]      extra report-only translations
+                  [5:10]     core_pages (untouched by admin flows)
+                  [11]       submit_page (left untranslated)
+        snippets: [0]        existing_snippet
+                  [1]        extra report-only translation
+                  [3]        submit_snippet (left untranslated)
     """
     from seed import build_snippet_pool, build_tree, ensure_locales, reset
 
@@ -113,12 +128,16 @@ def prepare():
     existing_page_source, existing_page_translation = _create_translation(
         existing_page, locales["fr"], user=user
     )
-    # A handful more page translations plus a couple of snippets, so the report
-    # view has several rows across content types — not a single one.
+    existing_snippet = snippets[0]
+    existing_snippet_source, existing_snippet_translation = _create_translation(
+        existing_snippet, locales["fr"], user=user
+    )
+
+    # Extra translations so the report view has several rows across content
+    # types, not just the "existing" ones above.
     for page in pages[1:REPORT_PAGE_TRANSLATIONS]:
         _create_translation(page, locales["fr"], user=user)
-    for snippet in snippets[:2]:
-        _create_translation(snippet, locales["fr"], user=user)
+    _create_translation(snippets[1], locales["fr"], user=user)
 
     return SimpleNamespace(
         locales=locales,
@@ -129,15 +148,59 @@ def prepare():
         existing_page=existing_page,
         existing_page_source=existing_page_source,
         existing_page_translation=existing_page_translation,
-        # A page left untranslated, for the submit flow to create fresh.
+        existing_snippet=existing_snippet,
+        existing_snippet_source=existing_snippet_source,
+        existing_snippet_translation=existing_snippet_translation,
+        # Left untranslated, for the submit flows to create fresh.
         submit_page=pages[-1],
+        submit_snippet=snippets[-1],
+        # A slice untouched by the setup above, for the core operations flows.
+        core_pages=pages[5 : 5 + CORE_PAGES],
     )
 
 
 # ---------------------------------------------------------------------------
-# Flows. Each drives one real admin URL through the Django test client and
-# returns the response. Only the action is here; preconditions live in `setup`.
+# Core flows: call the operations layer directly (no HTTP, no admin client).
+# These return None — there's no response/status_code to report.
 # ---------------------------------------------------------------------------
+
+
+def core_create_translations(ctx):
+    from wagtail_localize.operations import TranslationCreator
+
+    creator = TranslationCreator(user=ctx.user, target_locales=[ctx.locales["es"]])
+    for page in ctx.core_pages:
+        creator.create_translations(page)
+
+
+def core_synchronize_tree(ctx):
+    from wagtail_localize.synctree import synchronize_tree
+
+    synchronize_tree(ctx.locales["en"], ctx.locales["fr"])
+    synchronize_tree(ctx.locales["en"], ctx.locales["es"])
+
+
+def core_refresh_segments(ctx):
+    ctx.existing_page_source.refresh_segments()
+
+
+def core_save_target(ctx):
+    ctx.existing_page_translation.save_target(user=ctx.user, publish=True)
+
+
+# ---------------------------------------------------------------------------
+# Admin flows. Each drives one real admin URL through the Django test client
+# and returns the response. Only the action is here; preconditions live in
+# `setup`.
+# ---------------------------------------------------------------------------
+
+
+def submit_page_get(ctx):
+    from django.urls import reverse
+
+    return ctx.client.get(
+        reverse("wagtail_localize:submit_page_translation", args=[ctx.submit_page.id])
+    )
 
 
 def submit_page_post(ctx):
@@ -146,6 +209,30 @@ def submit_page_post(ctx):
     return ctx.client.post(
         reverse("wagtail_localize:submit_page_translation", args=[ctx.submit_page.id]),
         {"locales": [ctx.locales["fr"].id]},
+    )
+
+
+def submit_snippet_post(ctx):
+    from django.urls import reverse
+
+    model = type(ctx.submit_snippet)
+    return ctx.client.post(
+        reverse(
+            "wagtail_localize:submit_snippet_translation",
+            args=[model._meta.app_label, model._meta.model_name, ctx.submit_snippet.pk],
+        ),
+        {"locales": [ctx.locales["fr"].id]},
+    )
+
+
+def update_translations_get(ctx):
+    from django.urls import reverse
+
+    return ctx.client.get(
+        reverse(
+            "wagtail_localize:update_translations",
+            args=[ctx.existing_page_source.id],
+        )
     )
 
 
@@ -167,18 +254,98 @@ def _update_translations_setup(ctx):
     _touch_source_page(ctx.existing_page)
 
 
+# ---------------------------------------------------------------------------
+# Report/API flows — read paths rather than write paths.
+# ---------------------------------------------------------------------------
+
+
 def translations_report_get(ctx):
     from django.urls import reverse
 
     return ctx.client.get(reverse("wagtail_localize:translations_report"))
 
 
+def snippets_api_list(ctx):
+    from django.urls import reverse
+
+    model = type(ctx.existing_snippet)
+    return ctx.client.get(
+        reverse(
+            "wagtail_localize:snippets_api_listing",
+            args=[model._meta.app_label, model._meta.model_name],
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
-# The catalog: what we evaluate and why. Three flows — one write (create), one
-# write (update/publish), one read (report).
+# The catalog: what we evaluate and why.
+#
+# preview_translation was left out on purpose: exercising it correctly needs
+# get_ephemeral_translated_instance + user_can_edit_instance + the target
+# page's preview_modes lining up, which is more moving parts than the other
+# flows here for one more read path. Not included until that's worth it.
 # ---------------------------------------------------------------------------
 
 FLOW_CATALOG = [
+    Flow(
+        name="core_create_translations",
+        why="Covers the core translation-creation logic directly, without the admin view/HTTP layer around it.",
+        entrypoint="wagtail_localize.operations.TranslationCreator.create_translations",
+        covers=(
+            "TranslationCreator.create_translations",
+            "TranslationSource.get_or_create_from_instance",
+            "TranslationSource.refresh_segments",
+            "related-object fan-out (snippets referenced by pages)",
+        ),
+        scale_dimensions=(
+            "pages",
+            "related snippets",
+            "segments",
+        ),
+        run=core_create_translations,
+    ),
+    Flow(
+        name="core_synchronize_tree",
+        why="Covers locale tree alias creation for pages missing in target locales.",
+        entrypoint="wagtail_localize.synctree.synchronize_tree",
+        covers=(
+            "PageIndex.from_database",
+            "PageIndex.not_translated_into",
+            "Page.copy_for_translation(alias=True)",
+        ),
+        scale_dimensions=("pages", "tree depth", "locales"),
+        run=core_synchronize_tree,
+    ),
+    Flow(
+        name="core_refresh_segments",
+        why="Covers re-extracting segments from an existing, already-translated source.",
+        entrypoint="wagtail_localize.models.TranslationSource.refresh_segments",
+        covers=(
+            "TranslationSource.refresh_segments",
+            "segment extraction (StringSegment/TemplateSegment/RelatedObjectSegment)",
+        ),
+        scale_dimensions=("segments", "child objects"),
+        run=core_refresh_segments,
+    ),
+    Flow(
+        name="core_save_target",
+        why="Covers writing a translated target instance from existing translations.",
+        entrypoint="wagtail_localize.models.Translation.save_target",
+        covers=(
+            "Translation.save_target",
+            "copy_synchronised_fields",
+        ),
+        scale_dimensions=("segments", "child objects"),
+        run=core_save_target,
+    ),
+    Flow(
+        name="submit_page_get",
+        why="Covers rendering the submit-page-translation form.",
+        entrypoint="SubmitPageTranslationView.get/get_context_data",
+        covers=("SubmitTranslationForm construction",),
+        scale_dimensions=("locales available",),
+        run=submit_page_get,
+    ),
     Flow(
         name="submit_page_post",
         why="Covers initial translation creation from the admin submit flow.",
@@ -197,6 +364,26 @@ FLOW_CATALOG = [
             "locales",
         ),
         run=submit_page_post,
+    ),
+    Flow(
+        name="submit_snippet_post",
+        why="Covers initial translation creation for a snippet rather than a page — a different admin entrypoint over the same core logic.",
+        entrypoint="SubmitSnippetTranslationView.post/form_valid",
+        covers=(
+            "TranslationCreator.create_translations",
+            "TranslationSource.get_or_create_from_instance",
+            "Translation.save_target",
+        ),
+        scale_dimensions=("locales",),
+        run=submit_snippet_post,
+    ),
+    Flow(
+        name="update_translations_get",
+        why="Covers rendering the update-translations form for an existing source.",
+        entrypoint="UpdateTranslationsView.get/get_context_data",
+        covers=("UpdateTranslationsForm construction",),
+        scale_dimensions=("translations for this source",),
+        run=update_translations_get,
     ),
     Flow(
         name="update_translations_post_publish",
@@ -231,6 +418,14 @@ FLOW_CATALOG = [
             "locales",
         ),
         run=translations_report_get,
+    ),
+    Flow(
+        name="snippets_api_list",
+        why="Covers the snippets listing API, a separate read path from the report view.",
+        entrypoint="wagtail_localize.views.snippets_api.SnippetViewSet (list)",
+        covers=("BaseSnippetSerializer listing",),
+        scale_dimensions=("snippet count",),
+        run=snippets_api_list,
     ),
 ]
 
