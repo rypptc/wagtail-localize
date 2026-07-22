@@ -174,10 +174,13 @@ def core_create_translations(ctx):
 
 
 def core_synchronize_tree(ctx):
-    from wagtail_localize.synctree import synchronize_tree
+    from wagtail_localize.synctree import PageIndex, synchronize_tree
 
-    synchronize_tree(ctx.locales["en"], ctx.locales["fr"])
-    synchronize_tree(ctx.locales["en"], ctx.locales["es"])
+    # Mirror the sync_locale_trees management command: build the PageIndex once
+    # and reuse it across every target locale, instead of rebuilding it per call.
+    page_index = PageIndex.from_database().sort_by_tree_position()
+    for target in (ctx.locales["fr"], ctx.locales["es"]):
+        synchronize_tree(ctx.locales["en"], target, page_index=page_index)
 
 
 def core_refresh_segments(ctx):
@@ -306,10 +309,12 @@ FLOW_CATALOG = [
     ),
     Flow(
         name="core_synchronize_tree",
-        why="Covers locale tree alias creation for pages missing in target locales.",
-        entrypoint="wagtail_localize.synctree.synchronize_tree",
+        why="Covers multi-locale tree sync the way the sync_locale_trees command runs it: one PageIndex built once and reused across every target locale.",
+        entrypoint="wagtail_localize.management.commands.sync_locale_trees (shared PageIndex + synchronize_tree per locale)",
         covers=(
             "PageIndex.from_database",
+            "PageIndex.sort_by_tree_position",
+            "PageIndex reuse across target locales",
             "PageIndex.not_translated_into",
             "Page.copy_for_translation(alias=True)",
         ),
