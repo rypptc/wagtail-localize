@@ -23,6 +23,11 @@ CORE_PAGES = 5
 # rows rather than a single one. Still small — a smoke test with a bit of body,
 # not a scale sweep.
 REPORT_PAGE_TRANSLATIONS = 5
+# How many StreamField blocks to load onto the dedicated refresh page, so
+# refresh_segments fans out over many segments rather than the handful an
+# ordinary page carries (mirrors wl-benchmark's make_body(groups)). Big enough
+# that the per-segment cost is visible to a single-run diagnostic tool.
+REFRESH_SEGMENT_BLOCKS = 40
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,7 @@ def prepare():
         pages:    [0]        existing_page
                   [1:5]      extra report-only translations
                   [5:10]     core_pages (untouched by admin flows)
+                  [10]       refresh_page (heavy StreamField, for core_refresh_segments)
                   [11]       submit_page (left untranslated)
         snippets: [0]        existing_snippet
                   [1]        extra report-only translation
@@ -139,6 +145,22 @@ def prepare():
         _create_translation(page, locales["fr"], user=user)
     _create_translation(snippets[1], locales["fr"], user=user)
 
+    # A page loaded with many StreamField blocks, so core_refresh_segments fans
+    # out over many segments instead of the handful an ordinary page carries.
+    # Kept on its own slot (pages[10], untouched by every other flow) so the
+    # rest of the suite's query counts stay unaffected. The blocks must exist
+    # before the source is created — refresh_segments re-extracts from the
+    # source's stored content, not the live page.
+    refresh_page = pages[10]
+    refresh_page.test_streamfield = [
+        ("test_charblock", f"Refresh segment block {i}")
+        for i in range(REFRESH_SEGMENT_BLOCKS)
+    ]
+    refresh_page.save_revision().publish()
+    refresh_page_source, _refresh_page_translation = _create_translation(
+        refresh_page, locales["fr"], user=user
+    )
+
     return SimpleNamespace(
         locales=locales,
         client=client,
@@ -151,6 +173,10 @@ def prepare():
         existing_snippet=existing_snippet,
         existing_snippet_source=existing_snippet_source,
         existing_snippet_translation=existing_snippet_translation,
+        # A StreamField-heavy page + its source, so core_refresh_segments has
+        # many segments to re-extract.
+        refresh_page=refresh_page,
+        refresh_page_source=refresh_page_source,
         # Left untranslated, for the submit flows to create fresh.
         submit_page=pages[-1],
         submit_snippet=snippets[-1],
@@ -184,7 +210,7 @@ def core_synchronize_tree(ctx):
 
 
 def core_refresh_segments(ctx):
-    ctx.existing_page_source.refresh_segments()
+    ctx.refresh_page_source.refresh_segments()
 
 
 def core_save_target(ctx):
@@ -323,7 +349,7 @@ FLOW_CATALOG = [
     ),
     Flow(
         name="core_refresh_segments",
-        why="Covers re-extracting segments from an existing, already-translated source.",
+        why="Covers re-extracting segments from an already-translated source, on a page loaded with many StreamField blocks so the per-segment cost is exercised, not hidden by a tiny page.",
         entrypoint="wagtail_localize.models.TranslationSource.refresh_segments",
         covers=(
             "TranslationSource.refresh_segments",
