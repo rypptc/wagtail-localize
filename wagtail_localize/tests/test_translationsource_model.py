@@ -1,8 +1,11 @@
 import json
+import uuid
+
+from unittest import mock
 
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
-from django.db import connection
+from django.db import IntegrityError, connection
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -12,13 +15,21 @@ from wagtail.models import Locale, Page, PageLogEntry
 from wagtail_localize.models import (
     MissingRelatedObjectError,
     MissingTranslationError,
+    OverridableSegment,
+    RelatedObjectSegment,
     SourceDeletedError,
     String,
+    StringSegment,
     StringTranslation,
+    Template,
+    TemplateSegment,
     TranslationContext,
     TranslationSource,
 )
-from wagtail_localize.segments import RelatedObjectSegmentValue
+from wagtail_localize.segments import (
+    RelatedObjectSegmentValue,
+    TemplateSegmentValue,
+)
 from wagtail_localize.strings import StringValue
 from wagtail_localize.test.models import (
     TestChildObject,
@@ -997,6 +1008,216 @@ class TestSchemaOutOfDate(TestCase):
         self.assertTrue(self.source.schema_out_of_date())
 
 
+SEGMENT_MODELS = (
+    StringSegment,
+    TemplateSegment,
+    RelatedObjectSegment,
+    OverridableSegment,
+)
+
+
+def refresh_page(**kwargs):
+    """A page carrying all four kinds of segment, plus its reconciled source."""
+    snippet = TestSnippet.objects.create(field=kwargs.pop("snippet_field", "A snippet"))
+    blocks = kwargs.pop("blocks", ["Block 0", "Block 1"])
+    page = create_test_page(
+        test_charfield="Some translatable content",
+        test_richtextfield="<p>Some <b>rich</b> text</p>",
+        test_snippet=snippet,
+        test_synchronized_charfield="Overridable content",
+        test_streamfield=StreamValue(
+            TestStreamBlock(),
+            [{"type": "test_charblock", "value": block} for block in blocks],
+            is_lazy=True,
+        ),
+        **kwargs,
+    )
+    return page, TranslationSource.objects.get(object_id=page.translation_key)
+
+
+def segment_rows(source):
+    """Every segment row of every type, as (pk, context, order) in pk order."""
+    return {
+        model.__name__: [
+            (segment.pk, segment.context_id, segment.order)
+            for segment in model.objects.filter(source=source).order_by("pk")
+        ]
+        for model in SEGMENT_MODELS
+    }
+
+
+class TestRefreshSegmentsBehaviour(TestCase):
+    def test_refreshing_an_unchanged_source_changes_nothing(self):
+        _page, source = refresh_page(title="Warm", slug="warm")
+        before = segment_rows(source)
+
+        with mock.patch(
+            "wagtail_localize.models._compute_field_path"
+        ) as compute_field_path:
+            source.refresh_segments()
+
+        # Every context already has its field path, so nothing has to walk the
+        # instance to work one out.
+        compute_field_path.assert_not_called()
+        self.assertEqual(segment_rows(source), before)
+        for model in SEGMENT_MODELS:
+            with self.subTest(model=model.__name__):
+                self.assertTrue(before[model.__name__])
+
+    def test_changed_content_adds_and_removes_only_what_moved(self):
+        page, source = refresh_page(
+            title="Changed", slug="changed", blocks=["Keep me", "Also keep me"]
+        )
+        # The stream blocks are left alone, so their rows should be too. Only
+        # the charfield's segment has anything to change about it.
+        untouched = {
+            data: StringSegment.objects.get(source=source, string__data=data).pk
+            for data in ("Keep me", "Also keep me")
+        }
+
+        page.test_charfield = "Brand new content"
+        page.save_revision().publish()
+        source.update_from_db()
+
+        data = set(
+            StringSegment.objects.filter(source=source).values_list(
+                "string__data", flat=True
+            )
+        )
+        self.assertIn("Brand new content", data)
+        self.assertNotIn("Some translatable content", data)
+        for value, pk in untouched.items():
+            with self.subTest(segment=value):
+                self.assertEqual(
+                    StringSegment.objects.get(source=source, string__data=value).pk, pk
+                )
+
+    def test_a_first_extraction_writes_every_type_and_keeps_it(self):
+        snippet = TestSnippet.objects.create(field="First snippet")
+        page = Page.objects.get(id=1).add_child(
+            instance=TestPage(
+                title="First",
+                slug="first",
+                test_charfield="Some translatable content",
+                test_richtextfield="<p>Some <b>rich</b> text</p>",
+                test_snippet=snippet,
+                test_synchronized_charfield="Overridable content",
+                test_streamfield=StreamValue(
+                    TestStreamBlock(),
+                    [{"type": "test_charblock", "value": "Block 0"}],
+                    is_lazy=True,
+                ),
+            )
+        )
+        page.save_revision().publish()
+        page.refresh_from_db()
+
+        source, created = TranslationSource.get_or_create_from_instance(page)
+        self.assertTrue(created)
+
+        # Read the tables again: an insert that the reconciliation deleted
+        # would be invisible in the objects the call returned.
+        for model in SEGMENT_MODELS:
+            with self.subTest(model=model.__name__):
+                self.assertTrue(model.objects.filter(source=source).exists())
+        self.assertEqual(
+            set(
+                StringSegment.objects.filter(source=source).values_list(
+                    "string__data", flat=True
+                )
+            ),
+            {"Some translatable content", "Some <b>rich</b> text", "Block 0"},
+        )
+
+    def test_a_repeated_string_is_stored_once(self):
+        _page, source = refresh_page(
+            title="Repeats", slug="repeats", blocks=["Same text", "Same text"]
+        )
+
+        self.assertEqual(String.objects.filter(data="Same text").count(), 1)
+        self.assertEqual(
+            StringSegment.objects.filter(
+                source=source, string__data="Same text"
+            ).count(),
+            2,
+        )
+
+    def test_derived_fields_are_computed_for_rows_it_creates(self):
+        _page, source = refresh_page(title="Derived", slug="derived")
+
+        for string in String.objects.filter(segments__source=source).distinct():
+            with self.subTest(data=string.data):
+                self.assertEqual(string.data_hash, String._get_data_hash(string.data))
+
+        contexts = TranslationContext.objects.filter(object_id=source.object_id)
+        self.assertTrue(contexts.exists())
+        for context in contexts:
+            with self.subTest(path=context.path):
+                self.assertEqual(
+                    context.path_id, TranslationContext._get_path_id(context.path)
+                )
+                self.assertTrue(context.field_path)
+
+        template = TemplateSegment.objects.get(source=source).template
+        namespace = uuid.uuid5(Template.BASE_UUID_NAMESPACE, template.template_format)
+        self.assertEqual(template.uuid, uuid.uuid5(namespace, template.template))
+
+    def test_a_duplicated_row_for_a_wanted_key_is_not_hidden(self):
+        _page, source = refresh_page(title="Duplicated", slug="duplicated")
+        original = StringSegment.objects.get(source=source, string__data="Block 0")
+        StringSegment.objects.create(
+            source=source,
+            context=original.context,
+            order=original.order,
+            string=original.string,
+            attrs=original.attrs,
+        )
+
+        # The get_or_create() this replaced raised for the same reason.
+        with self.assertRaises(StringSegment.MultipleObjectsReturned):
+            source.refresh_segments()
+
+        self.assertEqual(
+            StringSegment.objects.filter(source=source, string__data="Block 0").count(),
+            2,
+        )
+
+
+class TestRefreshSegmentsStaleRows(TestCase):
+    """Split out because it drives the page through a content change after
+    leaving duplicated rows behind."""
+
+    def test_duplicates_of_a_key_that_is_gone_are_deleted(self):
+        page, source = refresh_page(
+            title="Stale", slug="stale", blocks=["Going away", "Staying"]
+        )
+        original = StringSegment.objects.get(source=source, string__data="Going away")
+        StringSegment.objects.create(
+            source=source,
+            context=original.context,
+            order=original.order,
+            string=original.string,
+            attrs=original.attrs,
+        )
+
+        page.test_streamfield = StreamValue(
+            TestStreamBlock(),
+            [{"type": "test_charblock", "value": "Staying"}],
+            is_lazy=True,
+        )
+        page.save_revision().publish()
+        source.update_from_db()
+
+        self.assertFalse(
+            StringSegment.objects.filter(
+                source=source, string__data="Going away"
+            ).exists()
+        )
+        self.assertTrue(
+            StringSegment.objects.filter(source=source, string__data="Staying").exists()
+        )
+
+
 class TestRefreshSegmentsQueryCount(TestCase):
     def _count_refresh_queries(self, num_blocks):
         page = create_test_page(
@@ -1020,10 +1241,70 @@ class TestRefreshSegmentsQueryCount(TestCase):
 
         return len(ctx.captured_queries)
 
-    def test_refresh_segments_query_count_scales_with_segments(self):
-        # Subtracting the two counts cancels the fixed overhead and isolates the
-        # marginal per-segment cost. Each extra segment currently adds ~4 queries.
+    def test_refresh_segments_query_count_does_not_grow_with_segments(self):
+        # Equality between two sizes rather than an absolute number: what the
+        # optimisation promises is that reconciling a source costs the same
+        # whether it holds three segments or twelve.
         small = self._count_refresh_queries(num_blocks=3)
         large = self._count_refresh_queries(num_blocks=12)
 
-        self.assertGreaterEqual(large - small, 9 * 4)
+        self.assertEqual(small, large)
+
+
+class TestRefreshSegmentsIdentity(TestCase):
+    """Two values that differ only in the part of a natural key the lookup
+    covers must not resolve to the same row."""
+
+    def setUp(self):
+        self.page, self.source = refresh_page(title="Identity", slug="identity")
+
+    def refresh_with(self, values):
+        with mock.patch(
+            "wagtail_localize.models.extract_segments", return_value=values
+        ):
+            self.source.refresh_segments()
+
+    def test_the_same_markup_in_two_formats_is_two_templates(self):
+        markup = "<p>Same markup, two formats</p>"
+        self.refresh_with(
+            [
+                TemplateSegmentValue("test_richtextfield", "html", markup, 0, order=0),
+                TemplateSegmentValue(
+                    "test_synchronized_richtextfield", "text", markup, 0, order=1
+                ),
+            ]
+        )
+
+        templates = Template.objects.filter(template=markup)
+        self.assertEqual(templates.count(), 2)
+        self.assertEqual(
+            {template.template_format for template in templates}, {"html", "text"}
+        )
+        self.assertEqual(len({template.uuid for template in templates}), 2)
+        self.assertEqual(TemplateSegment.objects.filter(source=self.source).count(), 2)
+
+    def test_one_translation_key_under_two_content_types_is_refused(self):
+        translation_key = TestSnippet.objects.first().translation_key
+        page_type = ContentType.objects.get_for_model(Page)
+        snippet_type = ContentType.objects.get_for_model(TestSnippet)
+
+        # The stored object is the snippet, and it comes second on purpose: an
+        # index keyed on translation_key alone would resolve the whole key from
+        # this value and hand the page-typed value the snippet's object without
+        # noticing.
+        with self.assertRaises(IntegrityError):
+            self.refresh_with(
+                [
+                    RelatedObjectSegmentValue(
+                        "test_page", page_type, translation_key, order=0
+                    ),
+                    RelatedObjectSegmentValue(
+                        "test_snippet", snippet_type, translation_key, order=1
+                    ),
+                ]
+            )
+
+        # Nothing was attached to the object of the wrong type.
+        self.assertFalse(
+            RelatedObjectSegment.objects.filter(object__content_type=page_type).exists()
+        )
