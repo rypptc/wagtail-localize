@@ -73,6 +73,7 @@ name = "wagtail_localize"
 exclude = [
     "src/wagtail_localize/static_src",
     "src/wagtail_localize/static/.gitignore",
+    "benchmarks",
     "Makefile",
     "scripts",
     "docs",
