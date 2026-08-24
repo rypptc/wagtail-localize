@@ -133,6 +133,64 @@ class TestPageIndex(TestCase):
             "cost grew with the number of pages again.",
         )
 
+    def test_from_page_instance(self):
+        """Entry.from_page_instance(page) builds an Entry from a single page.
+
+        from_database() does not call this — it assembles entries in bulk
+        instead — but the method is published in the package's reference
+        documentation, so it must keep working on its own.
+        """
+        fr_homepage = self.en_homepage.copy_for_translation(self.fr_locale)
+        fr_homepage.copy_for_translation(self.fr_ca_locale)
+        en_aboutpage = self.en_homepage.add_child(
+            instance=TestPage(title="About", slug="about")
+        )
+        fr_aboutpage = en_aboutpage.copy_for_translation(self.fr_locale)
+        fr_aboutpage.copy_for_translation(self.fr_ca_locale, alias=True)
+
+        entry = PageIndex.Entry.from_page_instance(en_aboutpage)
+
+        self.assertEqual(
+            entry.content_type, ContentType.objects.get_for_model(TestPage)
+        )
+        self.assertEqual(entry.translation_key, en_aboutpage.translation_key)
+        self.assertEqual(entry.source_locale, self.en_locale)
+        self.assertEqual(entry.parent_translation_key, self.en_homepage.translation_key)
+        self.assertEqual(entry.locales, [self.en_locale.id, self.fr_locale.id])
+        self.assertEqual(entry.aliased_locales, [self.fr_ca_locale.id])
+
+    def test_from_page_instance_matches_from_database(self):
+        """Both construction paths produce the same Entry for the same page.
+
+        from_database() assembles entries from data fetched in bulk;
+        from_page_instance() queries per page. If the shape of Entry changes,
+        this is what catches the path that was forgotten.
+        """
+        fr_homepage = self.en_homepage.copy_for_translation(self.fr_locale)
+        fr_homepage.copy_for_translation(self.fr_ca_locale)
+        en_aboutpage = self.en_homepage.add_child(
+            instance=TestPage(title="About", slug="about")
+        )
+        fr_aboutpage = en_aboutpage.copy_for_translation(self.fr_locale)
+        fr_aboutpage.copy_for_translation(self.fr_ca_locale, alias=True)
+
+        # The index holds one entry per non-alias page, so the translated
+        # About page appears once for en and once for fr; pick the en one.
+        bulk_entry = next(
+            entry
+            for entry in PageIndex.from_database()
+            if entry.translation_key == en_aboutpage.translation_key
+            and entry.source_locale == self.en_locale
+        )
+        single_entry = PageIndex.Entry.from_page_instance(en_aboutpage)
+
+        for field in PageIndex.Entry.__slots__:
+            self.assertEqual(
+                getattr(single_entry, field),
+                getattr(bulk_entry, field),
+                f"Entry field {field!r} differs between construction paths",
+            )
+
 
 class TestSignalsAndHooks(TestCase, WagtailTestUtils):
     def setUp(self):
