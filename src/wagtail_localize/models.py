@@ -592,93 +592,64 @@ class TranslationSource(models.Model):
         self._reconcile_segments(
             StringSegment,
             self.stringsegment_set.all(),
+            [
+                StringSegment(
+                    source=self,
+                    context=contexts[value.path],
+                    order=value.order,
+                    string=strings[value.string.data],
+                    attrs=json.dumps(value.attrs, cls=DjangoJSONEncoder),
+                )
+                for value in string_values
+            ],
             lambda segment: (
                 segment.context_id,
                 segment.order,
                 segment.string_id,
                 segment.attrs,
             ),
-            [
-                (
-                    (
-                        contexts[value.path].pk,
-                        value.order,
-                        strings[String._get_data_hash(value.string.data)].pk,
-                        json.dumps(value.attrs, cls=DjangoJSONEncoder),
-                    ),
-                    lambda value=value: StringSegment(
-                        source=self,
-                        context=contexts[value.path],
-                        order=value.order,
-                        string=strings[String._get_data_hash(value.string.data)],
-                        attrs=json.dumps(value.attrs, cls=DjangoJSONEncoder),
-                    ),
-                )
-                for value in string_values
-            ],
         )
         self._reconcile_segments(
             TemplateSegment,
             self.templatesegment_set.all(),
-            lambda segment: (segment.context_id, segment.order, segment.template_id),
             [
-                (
-                    (
-                        contexts[value.path].pk,
-                        value.order,
-                        templates[_template_uuid(value)].pk,
-                    ),
-                    lambda value=value: TemplateSegment(
-                        source=self,
-                        context=contexts[value.path],
-                        order=value.order,
-                        template=templates[_template_uuid(value)],
-                    ),
+                TemplateSegment(
+                    source=self,
+                    context=contexts[value.path],
+                    order=value.order,
+                    template=templates[_template_value_key(value)],
                 )
                 for value in template_values
             ],
+            lambda segment: (segment.context_id, segment.order, segment.template_id),
         )
         self._reconcile_segments(
             RelatedObjectSegment,
             self.relatedobjectsegment_set.all(),
-            lambda segment: (segment.context_id, segment.order, segment.object_id),
             [
-                (
-                    (
-                        contexts[value.path].pk,
-                        value.order,
-                        objects[_object_key(value)].pk,
-                    ),
-                    lambda value=value: RelatedObjectSegment(
-                        source=self,
-                        context=contexts[value.path],
-                        order=value.order,
-                        object=objects[_object_key(value)],
-                    ),
+                RelatedObjectSegment(
+                    source=self,
+                    context=contexts[value.path],
+                    order=value.order,
+                    object=objects[_object_key(value)],
                 )
                 for value in related_object_values
             ],
+            lambda segment: (segment.context_id, segment.order, segment.object_id),
         )
         self._reconcile_segments(
             OverridableSegment,
             self.overridablesegment_set.all(),
-            lambda segment: (segment.context_id, segment.order, segment.data_json),
             [
-                (
-                    (
-                        contexts[value.path].pk,
-                        value.order,
-                        json.dumps(value.data, cls=DjangoJSONEncoder),
-                    ),
-                    lambda value=value: OverridableSegment(
-                        source=self,
-                        context=contexts[value.path],
-                        order=value.order,
-                        data_json=json.dumps(value.data, cls=DjangoJSONEncoder),
-                    ),
+                OverridableSegment(
+                    source=self,
+                    context=contexts[value.path],
+                    order=value.order,
+                    data_json=json.dumps(value.data, cls=DjangoJSONEncoder),
                 )
                 for value in overridable_values
             ],
+            lambda segment: (segment.context_id, segment.order, segment.data_json),
         )
 
     def _contexts_for_paths(self, instance, paths):
@@ -714,25 +685,35 @@ class TranslationSource(models.Model):
         return contexts
 
     def _strings_for_values(self, values):
-        """The String for every extracted string value, keyed by its data hash."""
+        """The String for every extracted string value, keyed by its data."""
         if not values:
             return {}
 
         wanted = {}
+        hashes_by_data = {}
         for value in values:
+            data = value.string.data
+            if data in hashes_by_data:
+                continue
+
             candidate = String._candidate_from_value(self.locale_id, value.string)
+            hashes_by_data[data] = candidate.data_hash
             wanted.setdefault(candidate.data_hash, candidate)
 
-        return _bulk_resolve(
+        resolved_by_hash = _bulk_resolve(
             String,
             wanted,
             String.objects.filter(locale_id=self.locale_id, data_hash__in=list(wanted)),
             lambda string: string.data_hash,
         )
+        return {
+            data: resolved_by_hash[data_hash]
+            for data, data_hash in hashes_by_data.items()
+        }
 
     def _templates_for_values(self, values):
         """
-        The Template for every extracted template value, keyed by its uuid.
+        The Template for every extracted value, keyed by format and markup.
 
         The uuid covers the format as well as the HTML, so the same markup
         stored as two formats is two templates, exactly as Template.from_value
@@ -742,16 +723,26 @@ class TranslationSource(models.Model):
             return {}
 
         wanted = {}
+        uuids_by_value = {}
         for value in values:
+            key = _template_value_key(value)
+            if key in uuids_by_value:
+                continue
+
             candidate = Template._candidate_from_value(value)
+            uuids_by_value[key] = candidate.uuid
             wanted.setdefault(candidate.uuid, candidate)
 
-        return _bulk_resolve(
+        resolved_by_uuid = _bulk_resolve(
             Template,
             wanted,
             Template.objects.filter(uuid__in=list(wanted)),
             lambda template: template.uuid,
         )
+        return {
+            key: resolved_by_uuid[template_uuid]
+            for key, template_uuid in uuids_by_value.items()
+        }
 
     def _objects_for_values(self, values):
         """
@@ -781,14 +772,14 @@ class TranslationSource(models.Model):
             lambda obj: (obj.content_type_id, obj.translation_key),
         )
 
-    def _reconcile_segments(self, model, existing, key_of, wanted):
+    def _reconcile_segments(self, model, existing, candidates, key_of):
         """
         Bring one segment model into line with what the extraction produced.
 
-        `wanted` is a list of (key, build) pairs in extraction order, where
-        `build` returns an unsaved instance. Rows are matched by key against
-        what is already stored; anything unmatched is inserted and anything
-        stored under a key that is no longer wanted is deleted.
+        `candidates` contains unsaved instances in extraction order. Rows are
+        matched by key against what is already stored; anything unmatched is
+        inserted and anything stored under a key that is no longer wanted is
+        deleted.
 
         The primary keys of the inserted rows are never read: bulk_create()
         does not fill them in on every backend. Deleting by the ids collected
@@ -800,7 +791,8 @@ class TranslationSource(models.Model):
 
         seen = set()
         create = []
-        for key, build in wanted:
+        for candidate in candidates:
+            key = key_of(candidate)
             if key in seen:
                 # Two identical values in one extraction share a row, which is
                 # what two successive get_or_create() calls would have done.
@@ -816,7 +808,7 @@ class TranslationSource(models.Model):
                     f"returned {len(rows)}!"
                 )
             if not rows:
-                create.append(build())
+                create.append(candidate)
 
         if create:
             model.objects.bulk_create(create)
@@ -1743,6 +1735,11 @@ def _object_key(related_object_value):
     )
 
 
+def _template_value_key(template_value):
+    """The source-level identity of a template before its UUID is derived."""
+    return template_value.format, template_value.template
+
+
 def _bulk_resolve(model, wanted, queryset, key_of):
     """
     Resolve every key in `wanted` to a stored row, inserting what is missing.
@@ -1771,16 +1768,6 @@ def _bulk_resolve(model, wanted, queryset, key_of):
         )
 
     return {key: found[key] for key in wanted}
-
-
-def _template_uuid(template_value):
-    """
-    The uuid a TemplateValue is stored under.
-
-    Same derivation as Template.from_value(), needed here because bulk_create()
-    inserts rows without going through it.
-    """
-    return Template._candidate_from_value(template_value).uuid
 
 
 def _compute_field_path(instance, path):
