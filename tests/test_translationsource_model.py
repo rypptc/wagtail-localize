@@ -1043,6 +1043,69 @@ def segment_rows(source):
     }
 
 
+class TestValueCandidates(TestCase):
+    def test_string_candidate_matches_from_value_for_locale_or_id(self):
+        locale = Locale.get_default()
+
+        for locale_arg, data in (
+            (locale, "Built from a locale"),
+            (locale.pk, "Built from a locale id"),
+        ):
+            with self.subTest(locale_arg=locale_arg):
+                value = StringValue(data)
+                with self.assertNumQueries(0):
+                    candidate = String._candidate_from_value(locale_arg, value)
+
+                stored = String.from_value(locale_arg, value)
+                existing = String.from_value(locale_arg, value)
+
+                self.assertIsNone(candidate.pk)
+                self.assertEqual(candidate.locale_id, stored.locale_id)
+                self.assertEqual(candidate.data_hash, stored.data_hash)
+                self.assertEqual(candidate.data, stored.data)
+                self.assertEqual(existing.pk, stored.pk)
+
+    def test_template_candidate_matches_from_value(self):
+        value = TemplateSegmentValue(
+            "test_richtextfield",
+            "html",
+            "<p>Template candidate</p>",
+            1,
+            order=0,
+        )
+
+        with self.assertNumQueries(0):
+            candidate = Template._candidate_from_value(value)
+
+        stored = Template.from_value(value)
+        existing = Template.from_value(value)
+
+        self.assertIsNone(candidate.pk)
+        self.assertEqual(candidate.uuid, stored.uuid)
+        self.assertEqual(candidate.template, stored.template)
+        self.assertEqual(candidate.template_format, stored.template_format)
+        self.assertEqual(candidate.string_count, stored.string_count)
+        self.assertEqual(existing.pk, stored.pk)
+
+    def test_context_candidate_matches_the_stored_context(self):
+        _page, source = refresh_page(
+            title="Context candidate", slug="context-candidate"
+        )
+        stored = TranslationContext.objects.get(
+            object_id=source.object_id, path="test_charfield"
+        )
+
+        with self.assertNumQueries(0):
+            candidate = TranslationContext._candidate_from_path(
+                source.object_id, stored.path
+            )
+
+        self.assertIsNone(candidate.pk)
+        self.assertEqual(candidate.object_id, stored.object_id)
+        self.assertEqual(candidate.path, stored.path)
+        self.assertEqual(candidate.path_id, stored.path_id)
+
+
 class TestRefreshSegmentsBehaviour(TestCase):
     def test_refreshing_an_unchanged_source_changes_nothing(self):
         _page, source = refresh_page(title="Warm", slug="warm")
@@ -1246,6 +1309,15 @@ class TestRefreshSegmentsQueryCount(TestCase):
         large = self._count_refresh_queries(num_blocks=12)
 
         self.assertEqual(small, large)
+
+    def test_refresh_does_not_load_the_source_locale_relation(self):
+        page = create_test_page(title="Deferred locale", slug="deferred-locale")
+        source = TranslationSource.objects.get(object_id=page.translation_key)
+        self.assertNotIn("locale", source._state.fields_cache)
+
+        source.refresh_segments()
+
+        self.assertNotIn("locale", source._state.fields_cache)
 
 
 class TestRefreshSegmentsIdentity(TestCase):
