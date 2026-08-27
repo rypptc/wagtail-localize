@@ -1,6 +1,8 @@
 import json
 import uuid
 
+from collections import defaultdict
+
 import polib
 
 from django.apps import apps
@@ -9,7 +11,7 @@ from django.contrib.admin.utils import quote
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
 from django.core.serializers.json import DjangoJSONEncoder
-from django.db import OperationalError, models, transaction
+from django.db import IntegrityError, OperationalError, models, transaction
 from django.db.migrations.recorder import MigrationRecorder
 from django.db.models import (
     Case,
@@ -551,39 +553,297 @@ class TranslationSource(models.Model):
         Updates the *Segment models to reflect the latest version of the source.
 
         This is called by `from_instance` so you don't usually need to call this manually.
+
+        The work is done in bulk: the rows this source already has are loaded
+        once per model, the extracted values are matched against them in
+        memory, and only what is missing is inserted. The alternative, one
+        ``get_or_create()`` per extracted segment, costs a number of queries
+        proportional to the size of the page.
+
+        Note for very large sources: the preloads below use ``__in`` lookups,
+        which some backends cap (SQLite's variable limit, for instance). A
+        source with thousands of segments would need those batched.
         """
-        seen_string_segment_ids = []
-        seen_template_segment_ids = []
-        seen_related_object_segment_ids = []
-        seen_overridable_segment_ids = []
-
         instance = self.as_instance()
-        for segment in extract_segments(instance):
-            if isinstance(segment, TemplateSegmentValue):
-                segment_obj = TemplateSegment.from_value(self, segment)
-                seen_template_segment_ids.append(segment_obj.id)
-            elif isinstance(segment, RelatedObjectSegmentValue):
-                segment_obj = RelatedObjectSegment.from_value(self, segment)
-                seen_related_object_segment_ids.append(segment_obj.id)
-            elif isinstance(segment, OverridableSegmentValue):
-                segment_obj = OverridableSegment.from_value(self, segment)
-                seen_overridable_segment_ids.append(segment_obj.id)
+        values = list(extract_segments(instance))
+
+        string_values = []
+        template_values = []
+        related_object_values = []
+        overridable_values = []
+        for value in values:
+            if isinstance(value, TemplateSegmentValue):
+                template_values.append(value)
+            elif isinstance(value, RelatedObjectSegmentValue):
+                related_object_values.append(value)
+            elif isinstance(value, OverridableSegmentValue):
+                overridable_values.append(value)
             else:
-                segment_obj = StringSegment.from_value(self, self.locale, segment)
-                seen_string_segment_ids.append(segment_obj.id)
+                string_values.append(value)
 
-            # Make sure the segment's field_path is pre-populated
-            segment_obj.context.get_field_path(instance)
+        contexts = self._contexts_for_paths(instance, {value.path for value in values})
+        strings = self._strings_for_values(string_values)
+        templates = self._templates_for_values(template_values)
+        objects = self._objects_for_values(related_object_values)
 
-        # Delete any segments that weren't mentioned
-        self.stringsegment_set.exclude(id__in=seen_string_segment_ids).delete()
-        self.templatesegment_set.exclude(id__in=seen_template_segment_ids).delete()
-        self.relatedobjectsegment_set.exclude(
-            id__in=seen_related_object_segment_ids
-        ).delete()
-        self.overridablesegment_set.exclude(
-            id__in=seen_overridable_segment_ids
-        ).delete()
+        # The keys below are the lookups the from_value() methods use, minus
+        # the source, which is fixed. Segments have no unique constraint, so
+        # identity is the whole lookup and nothing else.
+        self._reconcile_segments(
+            StringSegment,
+            self.stringsegment_set.all(),
+            lambda segment: (
+                segment.context_id,
+                segment.order,
+                segment.string_id,
+                segment.attrs,
+            ),
+            [
+                (
+                    (
+                        contexts[value.path].pk,
+                        value.order,
+                        strings[String._get_data_hash(value.string.data)].pk,
+                        json.dumps(value.attrs, cls=DjangoJSONEncoder),
+                    ),
+                    lambda value=value: StringSegment(
+                        source=self,
+                        context=contexts[value.path],
+                        order=value.order,
+                        string=strings[String._get_data_hash(value.string.data)],
+                        attrs=json.dumps(value.attrs, cls=DjangoJSONEncoder),
+                    ),
+                )
+                for value in string_values
+            ],
+        )
+        self._reconcile_segments(
+            TemplateSegment,
+            self.templatesegment_set.all(),
+            lambda segment: (segment.context_id, segment.order, segment.template_id),
+            [
+                (
+                    (
+                        contexts[value.path].pk,
+                        value.order,
+                        templates[_template_uuid(value)].pk,
+                    ),
+                    lambda value=value: TemplateSegment(
+                        source=self,
+                        context=contexts[value.path],
+                        order=value.order,
+                        template=templates[_template_uuid(value)],
+                    ),
+                )
+                for value in template_values
+            ],
+        )
+        self._reconcile_segments(
+            RelatedObjectSegment,
+            self.relatedobjectsegment_set.all(),
+            lambda segment: (segment.context_id, segment.order, segment.object_id),
+            [
+                (
+                    (
+                        contexts[value.path].pk,
+                        value.order,
+                        objects[_object_key(value)].pk,
+                    ),
+                    lambda value=value: RelatedObjectSegment(
+                        source=self,
+                        context=contexts[value.path],
+                        order=value.order,
+                        object=objects[_object_key(value)],
+                    ),
+                )
+                for value in related_object_values
+            ],
+        )
+        self._reconcile_segments(
+            OverridableSegment,
+            self.overridablesegment_set.all(),
+            lambda segment: (segment.context_id, segment.order, segment.data_json),
+            [
+                (
+                    (
+                        contexts[value.path].pk,
+                        value.order,
+                        json.dumps(value.data, cls=DjangoJSONEncoder),
+                    ),
+                    lambda value=value: OverridableSegment(
+                        source=self,
+                        context=contexts[value.path],
+                        order=value.order,
+                        data_json=json.dumps(value.data, cls=DjangoJSONEncoder),
+                    ),
+                )
+                for value in overridable_values
+            ],
+        )
+
+    def _contexts_for_paths(self, instance, paths):
+        """
+        The TranslationContext for every path, created if it does not exist.
+
+        The field_path is filled in afterwards, in one update, for the rows
+        that have none: the ones just inserted, and the ones from before
+        version 1.0, which get_field_path() used to fill in one at a time.
+        Computing it here rather than before the insert means a source whose
+        contexts already have theirs does not pay for the calculation at all —
+        it walks the instance, and for child relations that can query.
+        """
+        wanted = {}
+        for path in sorted(paths):
+            wanted[path] = TranslationContext(
+                object_id=self.object_id,
+                path=path,
+                path_id=TranslationContext._get_path_id(path),
+            )
+
+        contexts = _bulk_resolve(
+            TranslationContext,
+            wanted,
+            TranslationContext.objects.filter(object_id=self.object_id),
+            lambda context: context.path,
+        )
+
+        without_field_path = [
+            context for context in contexts.values() if not context.field_path
+        ]
+        for context in without_field_path:
+            context.field_path = _compute_field_path(instance, context.path)
+        if without_field_path:
+            TranslationContext.objects.bulk_update(without_field_path, ["field_path"])
+
+        return contexts
+
+    def _strings_for_values(self, values):
+        """The String for every extracted string value, keyed by its data hash."""
+        if not values:
+            return {}
+
+        wanted = {}
+        for value in values:
+            data_hash = String._get_data_hash(value.string.data)
+            if data_hash not in wanted:
+                wanted[data_hash] = String(
+                    locale_id=self.locale_id,
+                    data_hash=data_hash,
+                    data=value.string.data,
+                )
+
+        return _bulk_resolve(
+            String,
+            wanted,
+            String.objects.filter(locale_id=self.locale_id, data_hash__in=list(wanted)),
+            lambda string: string.data_hash,
+        )
+
+    def _templates_for_values(self, values):
+        """
+        The Template for every extracted template value, keyed by its uuid.
+
+        The uuid covers the format as well as the HTML, so the same markup
+        stored as two formats is two templates, exactly as Template.from_value
+        would resolve it.
+        """
+        if not values:
+            return {}
+
+        wanted = {}
+        for value in values:
+            template_uuid = _template_uuid(value)
+            if template_uuid not in wanted:
+                wanted[template_uuid] = Template(
+                    uuid=template_uuid,
+                    template=value.template,
+                    template_format=value.format,
+                    string_count=value.string_count,
+                )
+
+        return _bulk_resolve(
+            Template,
+            wanted,
+            Template.objects.filter(uuid__in=list(wanted)),
+            lambda template: template.uuid,
+        )
+
+    def _objects_for_values(self, values):
+        """
+        The TranslatableObject for every related object value.
+
+        Keyed on the whole natural key: an object stored under the same
+        translation_key with another content type is a different object, and
+        attaching the segment to it would point it at the wrong content.
+        """
+        if not values:
+            return {}
+
+        wanted = {}
+        for value in values:
+            key = _object_key(value)
+            if key not in wanted:
+                wanted[key] = TranslatableObject(
+                    content_type_id=key[0], translation_key=key[1]
+                )
+
+        return _bulk_resolve(
+            TranslatableObject,
+            wanted,
+            TranslatableObject.objects.filter(
+                translation_key__in={key[1] for key in wanted}
+            ),
+            lambda obj: (obj.content_type_id, obj.translation_key),
+        )
+
+    def _reconcile_segments(self, model, existing, key_of, wanted):
+        """
+        Bring one segment model into line with what the extraction produced.
+
+        `wanted` is a list of (key, build) pairs in extraction order, where
+        `build` returns an unsaved instance. Rows are matched by key against
+        what is already stored; anything unmatched is inserted and anything
+        stored under a key that is no longer wanted is deleted.
+
+        The primary keys of the inserted rows are never read: bulk_create()
+        does not fill them in on every backend. Deleting by the ids collected
+        from the snapshot gives the same final state without needing them.
+        """
+        stored = defaultdict(list)
+        for segment in existing:
+            stored[key_of(segment)].append(segment)
+
+        seen = set()
+        create = []
+        for key, build in wanted:
+            if key in seen:
+                # Two identical values in one extraction share a row, which is
+                # what two successive get_or_create() calls would have done.
+                continue
+            seen.add(key)
+
+            rows = stored.get(key, [])
+            if len(rows) > 1:
+                # The lookup a get_or_create() would run here matches more than
+                # one row, and it would raise for the same reason.
+                raise model.MultipleObjectsReturned(
+                    f"get() returned more than one {model.__name__} -- it "
+                    f"returned {len(rows)}!"
+                )
+            if not rows:
+                create.append(build())
+
+        if create:
+            model.objects.bulk_create(create)
+
+        stale = [
+            segment.pk
+            for key, rows in stored.items()
+            if key not in seen
+            for segment in rows
+        ]
+        if stale:
+            model.objects.filter(pk__in=stale).delete()
 
     def export_po(self):
         """
@@ -1479,6 +1739,137 @@ class String(models.Model):
         return StringValue(self.data)
 
 
+def _object_key(related_object_value):
+    """The natural key of the TranslatableObject a related value points at."""
+    return (
+        related_object_value.content_type.pk,
+        related_object_value.translation_key,
+    )
+
+
+def _bulk_resolve(model, wanted, queryset, key_of):
+    """
+    Resolve every key in `wanted` to a stored row, inserting what is missing.
+
+    `wanted` maps each natural key to an unsaved instance carrying it, first
+    occurrence winning, so a repeated key neither inserts twice nor resolves to
+    a second row. `queryset` finds the candidate rows and is evaluated again
+    after the insert; `key_of` reads the natural key back off a row.
+
+    A key that is still unresolved after the refetch is a conflict the insert
+    could not settle — another row already occupies that identity under a
+    different key — and it raises rather than resolving to the wrong row.
+    """
+    found = {key_of(row): row for row in queryset}
+
+    missing = [instance for key, instance in wanted.items() if key not in found]
+    if missing:
+        model.objects.bulk_create(missing, ignore_conflicts=True)
+        found.update({key_of(row): row for row in queryset.all()})
+
+    unresolved = [key for key in wanted if key not in found]
+    if unresolved:
+        raise IntegrityError(
+            f"could not resolve {model.__name__} for "
+            f"{', '.join(repr(key) for key in unresolved)}"
+        )
+
+    return {key: found[key] for key in wanted}
+
+
+def _template_uuid(template_value):
+    """
+    The uuid a TemplateValue is stored under.
+
+    Same derivation as Template.from_value(), needed here because bulk_create()
+    inserts rows without going through it.
+    """
+    namespace = uuid.uuid5(Template.BASE_UUID_NAMESPACE, template_value.format)
+    return uuid.uuid5(namespace, template_value.template)
+
+
+def _compute_field_path(instance, path):
+    """
+    Computes the field path for a content path against the given instance.
+
+    This is the calculation that used to live inside
+    ``TranslationContext.get_field_path``. Walking a child relation reads from
+    the database, so it is not free: ``refresh_segments`` resolves or inserts
+    its contexts first and then calls this only for the ones still without a
+    ``field_path``, writing them back together with a single ``bulk_update``.
+    """
+
+    def get_field_path_from_field(instance, path_components):
+        field_name = path_components[0]
+        field = instance._meta.get_field(field_name)
+
+        if isinstance(field, StreamField):
+
+            def get_field_path_from_streamfield_block(value, path_components):
+                if isinstance(value, blocks.StructValue):
+                    blocks_by_id = dict(value)
+                else:
+                    if isinstance(value, ListValue):
+                        blocks_by_id = {block.id: block for block in value.bound_blocks}
+                    else:
+                        blocks_by_id = {block.id: block for block in value}
+
+                block_id = path_components[0]
+                block = blocks_by_id[block_id]
+
+                if isinstance(value, blocks.StructValue):
+                    block_type = block_id
+                    block_def = value.block.child_blocks[block_type]
+                    block_value = block
+                else:
+                    if isinstance(value, ListValue):
+                        block_type = "item"
+                        block_def = value.list_block.child_block
+                    else:
+                        block_type = block.block_type
+                        block_def = value.stream_block.child_blocks[block_type]
+                    block_value = block.value
+
+                if apps.is_installed("wagtail.images"):
+                    from wagtail.images.blocks import ImageBlock
+
+                    if isinstance(block_def, ImageBlock):
+                        # the path components are ["the_image_block_field_name", "alt_text"]
+                        # so there is no need for further processing as this will return
+                        # ["image_block", "alt_text"]
+                        return [block_type] + path_components[1:]
+
+                if isinstance(
+                    block_def,
+                    blocks.StructBlock | blocks.StreamBlock | blocks.ListBlock,
+                ):
+                    return [block_type] + get_field_path_from_streamfield_block(
+                        block_value, path_components[1:]
+                    )
+                else:
+                    return [block_type]
+
+            return [field_name] + get_field_path_from_streamfield_block(
+                field.value_from_object(instance), path_components[1:]
+            )
+
+        elif (
+            isinstance(field, models.ManyToOneRel)
+            and isinstance(field.remote_field, ParentalKey)
+            and issubclass(field.related_model, TranslatableMixin)
+        ):
+            manager = getattr(instance, field_name)
+            child_instance = manager.get(translation_key=path_components[1])
+            return [field_name] + get_field_path_from_field(
+                child_instance, path_components[2:]
+            )
+
+        else:
+            return [field_name]
+
+    return ".".join(get_field_path_from_field(instance, path.split(".")))
+
+
 class TranslationContext(models.Model):
     """
     Represents a context that a string may be translated in.
@@ -1534,80 +1925,7 @@ class TranslationContext(models.Model):
         Field path's were introduced in version 1.0, any contexts that were created before that release won't have one.
         """
         if not self.field_path:
-
-            def get_field_path_from_field(instance, path_components):
-                field_name = path_components[0]
-                field = instance._meta.get_field(field_name)
-
-                if isinstance(field, StreamField):
-
-                    def get_field_path_from_streamfield_block(value, path_components):
-                        if isinstance(value, blocks.StructValue):
-                            blocks_by_id = dict(value)
-                        else:
-                            if isinstance(value, ListValue):
-                                blocks_by_id = {
-                                    block.id: block for block in value.bound_blocks
-                                }
-                            else:
-                                blocks_by_id = {block.id: block for block in value}
-
-                        block_id = path_components[0]
-                        block = blocks_by_id[block_id]
-
-                        if isinstance(value, blocks.StructValue):
-                            block_type = block_id
-                            block_def = value.block.child_blocks[block_type]
-                            block_value = block
-                        else:
-                            if isinstance(value, ListValue):
-                                block_type = "item"
-                                block_def = value.list_block.child_block
-                            else:
-                                block_type = block.block_type
-                                block_def = value.stream_block.child_blocks[block_type]
-                            block_value = block.value
-
-                        if apps.is_installed("wagtail.images"):
-                            from wagtail.images.blocks import ImageBlock
-
-                            if isinstance(block_def, ImageBlock):
-                                # the path components are ["the_image_block_field_name", "alt_text"]
-                                # so there is no need for further processing as this will return
-                                # ["image_block", "alt_text"]
-                                return [block_type] + path_components[1:]
-
-                        if isinstance(
-                            block_def,
-                            blocks.StructBlock | blocks.StreamBlock | blocks.ListBlock,
-                        ):
-                            return [block_type] + get_field_path_from_streamfield_block(
-                                block_value, path_components[1:]
-                            )
-                        else:
-                            return [block_type]
-
-                    return [field_name] + get_field_path_from_streamfield_block(
-                        field.value_from_object(instance), path_components[1:]
-                    )
-
-                elif (
-                    isinstance(field, models.ManyToOneRel)
-                    and isinstance(field.remote_field, ParentalKey)
-                    and issubclass(field.related_model, TranslatableMixin)
-                ):
-                    manager = getattr(instance, field_name)
-                    child_instance = manager.get(translation_key=path_components[1])
-                    return [field_name] + get_field_path_from_field(
-                        child_instance, path_components[2:]
-                    )
-
-                else:
-                    return [field_name]
-
-            self.field_path = ".".join(
-                get_field_path_from_field(instance, self.path.split("."))
-            )
+            self.field_path = _compute_field_path(instance, self.path)
             self.save(update_fields=["field_path"])
 
         return self.field_path
