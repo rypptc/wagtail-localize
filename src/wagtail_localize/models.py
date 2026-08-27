@@ -694,11 +694,7 @@ class TranslationSource(models.Model):
         """
         wanted = {}
         for path in sorted(paths):
-            wanted[path] = TranslationContext(
-                object_id=self.object_id,
-                path=path,
-                path_id=TranslationContext._get_path_id(path),
-            )
+            wanted[path] = TranslationContext._candidate_from_path(self.object_id, path)
 
         contexts = _bulk_resolve(
             TranslationContext,
@@ -724,13 +720,8 @@ class TranslationSource(models.Model):
 
         wanted = {}
         for value in values:
-            data_hash = String._get_data_hash(value.string.data)
-            if data_hash not in wanted:
-                wanted[data_hash] = String(
-                    locale_id=self.locale_id,
-                    data_hash=data_hash,
-                    data=value.string.data,
-                )
+            candidate = String._candidate_from_value(self.locale_id, value.string)
+            wanted.setdefault(candidate.data_hash, candidate)
 
         return _bulk_resolve(
             String,
@@ -752,14 +743,8 @@ class TranslationSource(models.Model):
 
         wanted = {}
         for value in values:
-            template_uuid = _template_uuid(value)
-            if template_uuid not in wanted:
-                wanted[template_uuid] = Template(
-                    uuid=template_uuid,
-                    template=value.template,
-                    template_format=value.format,
-                    string_count=value.string_count,
-                )
+            candidate = Template._candidate_from_value(value)
+            wanted.setdefault(candidate.uuid, candidate)
 
         return _bulk_resolve(
             Template,
@@ -1710,6 +1695,16 @@ class String(models.Model):
         return uuid.uuid5(cls.UUID_NAMESPACE, data)
 
     @classmethod
+    def _candidate_from_value(cls, locale, stringvalue):
+        """Build an unsaved String for a value without querying the database."""
+        data = stringvalue.data
+        return cls(
+            locale_id=pk(locale),
+            data_hash=cls._get_data_hash(data),
+            data=data,
+        )
+
+    @classmethod
     def from_value(cls, locale, stringvalue):
         """
         Gets or creates a String instance from a StringValue object.
@@ -1721,10 +1716,11 @@ class String(models.Model):
         Returns:
             String: The String instance that corresponds with the given stringvalue and locale.
         """
+        candidate = cls._candidate_from_value(locale, stringvalue)
         string, created = cls.objects.get_or_create(
-            locale_id=pk(locale),
-            data_hash=cls._get_data_hash(stringvalue.data),
-            defaults={"data": stringvalue.data},
+            locale_id=candidate.locale_id,
+            data_hash=candidate.data_hash,
+            defaults={"data": candidate.data},
         )
 
         return string
@@ -1784,8 +1780,7 @@ def _template_uuid(template_value):
     Same derivation as Template.from_value(), needed here because bulk_create()
     inserts rows without going through it.
     """
-    namespace = uuid.uuid5(Template.BASE_UUID_NAMESPACE, template_value.format)
-    return uuid.uuid5(namespace, template_value.template)
+    return Template._candidate_from_value(template_value).uuid
 
 
 def _compute_field_path(instance, path):
@@ -1917,6 +1912,15 @@ class TranslationContext(models.Model):
             UUID: The UUID hash.
         """
         return uuid.uuid5(uuid.UUID("fcab004a-2b50-11ea-978f-2e728ce88125"), path)
+
+    @classmethod
+    def _candidate_from_path(cls, object_id, path):
+        """Build an unsaved context with all derived fields populated."""
+        return cls(
+            object_id=pk(object_id),
+            path=path,
+            path_id=cls._get_path_id(path),
+        )
 
     def get_field_path(self, instance):
         """
@@ -2144,6 +2148,17 @@ class Template(models.Model):
         return f"Template: {self.uuid}, {self.template_format}, {self.string_count}"
 
     @classmethod
+    def _candidate_from_value(cls, template_value):
+        """Build an unsaved Template for a value without querying the database."""
+        namespace = uuid.uuid5(cls.BASE_UUID_NAMESPACE, template_value.format)
+        return cls(
+            uuid=uuid.uuid5(namespace, template_value.template),
+            template=template_value.template,
+            template_format=template_value.format,
+            string_count=template_value.string_count,
+        )
+
+    @classmethod
     def from_value(cls, template_value):
         """
         Gets or creates a Template instance from a TemplateValue object.
@@ -2154,14 +2169,13 @@ class Template(models.Model):
         Returns:
             Template: The Template instance that corresponds with the given template_value.
         """
-        uuid_namespace = uuid.uuid5(cls.BASE_UUID_NAMESPACE, template_value.format)
-
+        candidate = cls._candidate_from_value(template_value)
         template, created = cls.objects.get_or_create(
-            uuid=uuid.uuid5(uuid_namespace, template_value.template),
+            uuid=candidate.uuid,
             defaults={
-                "template": template_value.template,
-                "template_format": template_value.format,
-                "string_count": template_value.string_count,
+                "template": candidate.template,
+                "template_format": candidate.template_format,
+                "string_count": candidate.string_count,
             },
         )
 
