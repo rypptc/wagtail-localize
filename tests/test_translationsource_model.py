@@ -35,7 +35,11 @@ from wagtail_localize.models import (
     TranslationContext,
     TranslationSource,
 )
-from wagtail_localize.segments import RelatedObjectSegmentValue, TemplateSegmentValue
+from wagtail_localize.segments import (
+    RelatedObjectSegmentValue,
+    StringSegmentValue,
+    TemplateSegmentValue,
+)
 from wagtail_localize.strings import StringValue
 
 
@@ -1351,6 +1355,24 @@ class TestRefreshSegmentsIdentity(TestCase):
         )
         self.assertEqual(len({template.uuid for template in templates}), 2)
         self.assertEqual(TemplateSegment.objects.filter(source=self.source).count(), 2)
+
+    def test_a_string_hash_collision_is_not_resolved_to_the_wrong_string(self):
+        existing = String.from_value(
+            self.source.locale_id, StringValue("Existing string")
+        )
+        colliding = StringSegmentValue("test_charfield", "Different string")
+
+        with (
+            mock.patch.object(
+                String, "_get_data_hash", return_value=existing.data_hash
+            ),
+            self.assertRaisesRegex(
+                IntegrityError, "could not resolve String for 'Different string'"
+            ),
+        ):
+            self.source._strings_for_values([colliding])
+
+        self.assertFalse(String.objects.filter(data="Different string").exists())
 
     def test_one_translation_key_under_two_content_types_is_refused(self):
         translation_key = TestSnippet.objects.first().translation_key

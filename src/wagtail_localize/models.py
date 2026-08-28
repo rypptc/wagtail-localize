@@ -690,26 +690,22 @@ class TranslationSource(models.Model):
             return {}
 
         wanted = {}
-        hashes_by_data = {}
         for value in values:
             data = value.string.data
-            if data in hashes_by_data:
-                continue
+            if data not in wanted:
+                wanted[data] = String._candidate_from_value(
+                    self.locale_id, value.string
+                )
 
-            candidate = String._candidate_from_value(self.locale_id, value.string)
-            hashes_by_data[data] = candidate.data_hash
-            wanted.setdefault(candidate.data_hash, candidate)
-
-        resolved_by_hash = _bulk_resolve(
+        return _bulk_resolve(
             String,
             wanted,
-            String.objects.filter(locale_id=self.locale_id, data_hash__in=list(wanted)),
-            lambda string: string.data_hash,
+            String.objects.filter(
+                locale_id=self.locale_id,
+                data_hash__in=[candidate.data_hash for candidate in wanted.values()],
+            ),
+            lambda string: string.data,
         )
-        return {
-            data: resolved_by_hash[data_hash]
-            for data, data_hash in hashes_by_data.items()
-        }
 
     def _templates_for_values(self, values):
         """
@@ -723,26 +719,19 @@ class TranslationSource(models.Model):
             return {}
 
         wanted = {}
-        uuids_by_value = {}
         for value in values:
             key = _template_value_key(value)
-            if key in uuids_by_value:
-                continue
+            if key not in wanted:
+                wanted[key] = Template._candidate_from_value(value)
 
-            candidate = Template._candidate_from_value(value)
-            uuids_by_value[key] = candidate.uuid
-            wanted.setdefault(candidate.uuid, candidate)
-
-        resolved_by_uuid = _bulk_resolve(
+        return _bulk_resolve(
             Template,
             wanted,
-            Template.objects.filter(uuid__in=list(wanted)),
-            lambda template: template.uuid,
+            Template.objects.filter(
+                uuid__in=[candidate.uuid for candidate in wanted.values()]
+            ),
+            lambda template: (template.template_format, template.template),
         )
-        return {
-            key: resolved_by_uuid[template_uuid]
-            for key, template_uuid in uuids_by_value.items()
-        }
 
     def _objects_for_values(self, values):
         """
